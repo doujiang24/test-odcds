@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"sync"
 	"time"
 
 	clustercfg "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -15,19 +16,98 @@ import (
 	clustersvc "github.com/envoyproxy/go-control-plane/envoy/service/cluster/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/golang/protobuf/ptypes"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 type ODCDS struct {
-	l *log.Logger
+	l    *log.Logger
+	resp chan *discovery.DeltaDiscoveryResponse
+
+	mu       sync.Mutex
+	clusters []string
 }
 
 func (s *ODCDS) StreamClusters(scs clustersvc.ClusterDiscoveryService_StreamClustersServer) error {
 	return errors.New("not implemented")
 }
 
+func (s *ODCDS) response(dcs clustersvc.ClusterDiscoveryService_DeltaClustersServer) {
+	for {
+		select {
+		case resp := <-s.resp:
+			j, err := json.MarshalIndent(resp, "", "  ")
+			if err != nil {
+				s.l.Printf("Marshaling response JSON: %v", err)
+				continue
+			}
+			s.l.Printf("Sending response:\n%v", string(j))
+
+			err = dcs.Send(resp)
+			if err != nil {
+				s.l.Printf("Sending response: %v", err)
+				continue
+			}
+
+		case <-dcs.Context().Done():
+			return
+		}
+	}
+}
+
+func (s *ODCDS) updateClusters() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// local now timestamp string
+	label := time.Now().Format("2006-01-02 15:04:05")
+
+	for _, r := range s.clusters {
+		// Construct a response.
+		resources := []*discovery.Resource{}
+
+		cluster, err := ptypes.MarshalAny(makeCluster(r, "127.0.0.1", 8082, label))
+		if err != nil {
+			s.l.Printf("Marshalling cluster config: %v", err)
+			continue
+		}
+
+		resources = append(resources, &discovery.Resource{
+			Name:     r,
+			Resource: cluster,
+			Version:  "v1",
+			// Ttl:      ptypes.DurationProto(5 * time.Second),
+		})
+
+		nonce, err := makeNonce()
+		if err != nil {
+			s.l.Printf("Making nonce: %v", err)
+			continue
+		}
+
+		resp := &discovery.DeltaDiscoveryResponse{
+			Resources:         resources,
+			Nonce:             nonce,
+			TypeUrl:           "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+			SystemVersionInfo: "foo",
+		}
+
+		s.resp <- resp
+	}
+}
+
 func (s *ODCDS) DeltaClusters(dcs clustersvc.ClusterDiscoveryService_DeltaClustersServer) error {
 	// TODO: Handle concurrent requests.
 	// TODO: Handle Envoy disconnections properly.
+
+	go s.response(dcs)
+
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			s.updateClusters()
+		}
+	}()
+
 	for {
 		req, err := dcs.Recv()
 		if err != nil {
@@ -56,7 +136,7 @@ func (s *ODCDS) DeltaClusters(dcs clustersvc.ClusterDiscoveryService_DeltaCluste
 				continue
 			}
 
-			cluster, err := ptypes.MarshalAny(makeCluster(r, "127.0.0.1", 8081))
+			cluster, err := ptypes.MarshalAny(makeCluster(r, "127.0.0.1", 8081, "init"))
 			if err != nil {
 				s.l.Printf("Marshalling cluster config: %v", err)
 				continue
@@ -66,8 +146,12 @@ func (s *ODCDS) DeltaClusters(dcs clustersvc.ClusterDiscoveryService_DeltaCluste
 				Name:     r,
 				Resource: cluster,
 				Version:  "v1",
-				Ttl:      ptypes.DurationProto(5 * time.Second),
+				// Ttl:      ptypes.DurationProto(5 * time.Second),
 			})
+
+			s.mu.Lock()
+			s.clusters = append(s.clusters, r)
+			s.mu.Unlock()
 		}
 
 		nonce, err := makeNonce()
@@ -77,24 +161,13 @@ func (s *ODCDS) DeltaClusters(dcs clustersvc.ClusterDiscoveryService_DeltaCluste
 		}
 
 		resp := &discovery.DeltaDiscoveryResponse{
-			Resources:         resources,
-			Nonce:             nonce,
-			TypeUrl:           "type.googleapis.com/envoy.config.cluster.v3.Cluster",
-			SystemVersionInfo: "foo",
+			Resources: resources,
+			Nonce:     nonce,
+			TypeUrl:   "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+			// SystemVersionInfo: "foo",
 		}
 
-		j, err = json.MarshalIndent(resp, "", "  ")
-		if err != nil {
-			s.l.Printf("Marshaling response JSON: %v", err)
-			continue
-		}
-		s.l.Printf("Sending response:\n%v", string(j))
-
-		err = dcs.Send(resp)
-		if err != nil {
-			s.l.Printf("Sending response: %v", err)
-			continue
-		}
+		s.resp <- resp
 	}
 }
 
@@ -104,7 +177,8 @@ func (s *ODCDS) FetchClusters(context.Context, *discovery.DiscoveryRequest) (*di
 
 func NewServer(l *log.Logger) *ODCDS {
 	return &ODCDS{
-		l: l,
+		l:    l,
+		resp: make(chan *discovery.DeltaDiscoveryResponse),
 	}
 }
 
@@ -116,7 +190,7 @@ func makeNonce() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
-func makeCluster(name string, host string, port uint32) *clustercfg.Cluster {
+func makeCluster(name string, host string, port uint32, label string) *clustercfg.Cluster {
 	return &clustercfg.Cluster{
 		Name:           name,
 		ConnectTimeout: ptypes.DurationProto(2 * time.Second),
@@ -137,6 +211,15 @@ func makeCluster(name string, host string, port uint32) *clustercfg.Cluster {
 													PortValue: port,
 												},
 											},
+										},
+									},
+								},
+							},
+							Metadata: &corecfg.Metadata{
+								FilterMetadata: map[string]*structpb.Struct{
+									"envoy.lb": {
+										Fields: map[string]*structpb.Value{
+											"address": structpb.NewStringValue(label),
 										},
 									},
 								},
