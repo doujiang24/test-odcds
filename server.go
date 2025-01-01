@@ -141,7 +141,9 @@ func (s *ODCDS) DeltaClusters(dcs clustersvc.ClusterDiscoveryService_DeltaCluste
 				continue
 			}
 
-			cluster, err := ptypes.MarshalAny(makeCluster(r, "127.0.0.1", 8081, "init"))
+			label := r + "-init"
+
+			cluster, err := ptypes.MarshalAny(makeCluster(r, "127.0.0.1", 8081, label))
 			if err != nil {
 				s.l.Printf("Marshalling cluster config: %v", err)
 				continue
