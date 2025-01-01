@@ -96,12 +96,12 @@ func (s *ODCDS) updateClusters() {
 				SystemVersionInfo: "foo",
 			}
 
-			time.Sleep(2 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 
 			s.resp <- resp
 		}
 
-		time.Sleep(5 * time.Second)
+		time.Sleep(30 * time.Second)
 	}
 }
 
