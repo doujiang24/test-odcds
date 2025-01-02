@@ -55,53 +55,60 @@ func (s *ODCDS) response(dcs clustersvc.ClusterDiscoveryService_DeltaClustersSer
 	}
 }
 
-func (s *ODCDS) updateClusters() {
+func (s *ODCDS) updateClusters(dcs clustersvc.ClusterDiscoveryService_DeltaClustersServer) {
 	for {
-		// local now timestamp string
-		now := time.Now().Format("2006-01-02 15:04:05")
+		// check if dcs.Context().Done() channel is closed
+		select {
+		case <-dcs.Context().Done():
+			return
 
-		s.mu.Lock()
-		clusters := slices.Clone(s.clusters)
-		s.mu.Unlock()
+		default:
+			// local now timestamp string
+			now := time.Now().Format("2006-01-02 15:04:05")
 
-		for _, r := range clusters {
-			// Construct a response.
-			resources := []*discovery.Resource{}
+			s.mu.Lock()
+			clusters := slices.Clone(s.clusters)
+			s.mu.Unlock()
 
-			label := r + "-" + now
+			for _, r := range clusters {
+				// Construct a response.
+				resources := []*discovery.Resource{}
 
-			cluster, err := ptypes.MarshalAny(makeCluster(r, "127.0.0.1", 8082, label))
-			if err != nil {
-				s.l.Printf("Marshalling cluster config: %v", err)
-				continue
+				label := r + "-" + now
+
+				cluster, err := ptypes.MarshalAny(makeCluster(r, "127.0.0.1", 8082, label))
+				if err != nil {
+					s.l.Printf("Marshalling cluster config: %v", err)
+					continue
+				}
+
+				resources = append(resources, &discovery.Resource{
+					Name:     r,
+					Resource: cluster,
+					Version:  "v1",
+					// Ttl:      ptypes.DurationProto(5 * time.Second),
+				})
+
+				nonce, err := makeNonce()
+				if err != nil {
+					s.l.Printf("Making nonce: %v", err)
+					continue
+				}
+
+				resp := &discovery.DeltaDiscoveryResponse{
+					Resources:         resources,
+					Nonce:             nonce,
+					TypeUrl:           "type.googleapis.com/envoy.config.cluster.v3.Cluster",
+					SystemVersionInfo: "foo",
+				}
+
+				time.Sleep(10 * time.Millisecond)
+
+				s.resp <- resp
 			}
 
-			resources = append(resources, &discovery.Resource{
-				Name:     r,
-				Resource: cluster,
-				Version:  "v1",
-				// Ttl:      ptypes.DurationProto(5 * time.Second),
-			})
-
-			nonce, err := makeNonce()
-			if err != nil {
-				s.l.Printf("Making nonce: %v", err)
-				continue
-			}
-
-			resp := &discovery.DeltaDiscoveryResponse{
-				Resources:         resources,
-				Nonce:             nonce,
-				TypeUrl:           "type.googleapis.com/envoy.config.cluster.v3.Cluster",
-				SystemVersionInfo: "foo",
-			}
-
-			time.Sleep(10 * time.Millisecond)
-
-			s.resp <- resp
+			time.Sleep(30 * time.Second)
 		}
-
-		time.Sleep(30 * time.Second)
 	}
 }
 
@@ -111,7 +118,7 @@ func (s *ODCDS) DeltaClusters(dcs clustersvc.ClusterDiscoveryService_DeltaCluste
 
 	go s.response(dcs)
 
-	go s.updateClusters()
+	go s.updateClusters(dcs)
 
 	for {
 		req, err := dcs.Recv()
@@ -139,6 +146,11 @@ func (s *ODCDS) DeltaClusters(dcs clustersvc.ClusterDiscoveryService_DeltaCluste
 			if r == "" {
 				s.l.Println("Skipping empty resource name")
 				continue
+			}
+
+			if r == "foo" {
+				s.l.Printf("Got invalid cluster name foo")
+				return errors.New("invalid cluster name foo")
 			}
 
 			label := r + "-init"
